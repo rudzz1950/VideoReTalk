@@ -1,5 +1,6 @@
 import numpy as np
 import cv2, os, sys, subprocess, platform, torch
+import math
 from tqdm import tqdm
 from PIL import Image
 from scipy.io import loadmat
@@ -22,11 +23,97 @@ from utils import audio
 from utils.ffhq_preprocess import Croper
 from utils.alignment_stit import crop_faces, calc_alignment_coefficients, paste_image
 from utils.inference_utils import Laplacian_Pyramid_Blending_with_mask, face_detect, load_model, options, split_coeff, \
-                                  trans_image, transform_semantic, find_crop_norm_ratio, load_face3d_net, exp_aus_dict
+                                  trans_image, transform_semantic, find_crop_norm_ratio, load_face3d_net, exp_aus_dict, mask_postprocess
 import warnings
 warnings.filterwarnings("ignore")
 
 args = options()
+
+def _ffprobe_duration(path):
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nk=1:nw=1', path]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        return float(out.decode().strip())
+    except Exception as e:
+        print(f"[Warn] ffprobe failed for {path}: {e}")
+        return None
+
+def _split_into_chunks(face_path, audio_path, out_dir, fps, chunk_duration, overlap, enforce_sr=16000, crossfade=False):
+    os.makedirs(out_dir, exist_ok=True)
+    video_dur = _ffprobe_duration(face_path) or 0
+    audio_dur = _ffprobe_duration(audio_path) or 0
+    total_dur = min(video_dur, audio_dur) if (video_dur > 0 and audio_dur > 0) else max(video_dur, audio_dur)
+    if total_dur == 0:
+        raise RuntimeError('Could not determine media duration')
+    eff_overlap = overlap if crossfade else 0.0
+    step = max(0.0, chunk_duration - eff_overlap) if chunk_duration > 0 else total_dur
+    starts = []
+    t = 0.0
+    while t < total_dur:
+        starts.append(t)
+        t += step if step > 0 else total_dur
+    chunk_paths = []
+    for idx, start in enumerate(starts):
+        dur = min(chunk_duration if chunk_duration > 0 else total_dur, total_dur - start)
+        v_out = os.path.join(out_dir, f'video_{idx+1:03d}.mp4')
+        a_out = os.path.join(out_dir, f'audio_{idx+1:03d}.wav')
+        # Re-encode video chunk to enforce exact boundaries & fps
+        vcmd = ['ffmpeg', '-loglevel', 'error', '-y', '-ss', f'{start:.3f}', '-i', face_path, '-t', f'{dur:.3f}',
+                '-r', f'{fps:.3f}', '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p', v_out]
+        acmd = ['ffmpeg', '-loglevel', 'error', '-y', '-ss', f'{start:.3f}', '-i', audio_path, '-t', f'{dur:.3f}',
+                '-ac', '1', '-ar', str(enforce_sr), a_out]
+        try:
+            subprocess.check_call(vcmd, shell=False)
+            subprocess.check_call(acmd, shell=False)
+        except subprocess.CalledProcessError as e:
+            print(f"[Warn] Failed to split chunk {idx+1}: {e}")
+            continue
+        # Validate audio sample rate
+        try:
+            sr = _probe_audio_sr(a_out)
+            if sr != enforce_sr:
+                print(f"[Warn] Fixing sample rate for {a_out} (got {sr}); forcing {enforce_sr}")
+                fixcmd = ['ffmpeg', '-loglevel', 'error', '-y', '-i', a_out, '-ac', '1', '-ar', str(enforce_sr), a_out]
+                subprocess.check_call(fixcmd, shell=False)
+        except Exception as e:
+            print(f"[Warn] Could not validate audio sr for {a_out}: {e}")
+        chunk_paths.append((v_out, a_out))
+    return chunk_paths
+
+def _probe_audio_sr(path):
+    cmd = ['ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=sample_rate', '-of', 'default=nk=1:nw=1', path]
+    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+    return int(out.decode().strip())
+
+def _concat_media(list_file, output_path, stream='video', reencode=False, drop_audio=False):
+    # stream: 'video' or 'audio'
+    if stream == 'video':
+        if reencode:
+            cmd = ['ffmpeg', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', list_file, '-c:v', 'libx264', '-pix_fmt', 'yuv420p']
+        else:
+            cmd = ['ffmpeg', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', list_file, '-c', 'copy']
+        if drop_audio:
+            cmd += ['-an']
+        cmd += [output_path]
+    else:
+        cmd = ['ffmpeg', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', list_file, '-c', 'copy', output_path]
+    subprocess.check_call(cmd, shell=False)
+
+def _xfade_concatenate(videos, out_path, overlap):
+    # Simple pairwise xfade across N segments
+    if len(videos) == 1:
+        return videos[0]
+    cur = videos[0]
+    for i in range(1, len(videos)):
+        nxt = videos[i]
+        tmp = out_path.replace('.mp4', f'_xf{i:03d}.mp4')
+        cmd = ['ffmpeg', '-loglevel', 'error', '-y', '-i', cur, '-i', nxt,
+               '-filter_complex', f"[0:v][1:v]xfade=transition=fade:duration={overlap:.3f}:offset=PTS-STARTPTS[v];[0:a][1:a]acrossfade=d={overlap:.3f}[a]",
+               '-map', '[v]', '-map', '[a]', tmp]
+        subprocess.check_call(cmd, shell=False)
+        cur = tmp
+    os.replace(cur, out_path)
+    return out_path
 
 def main():    
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -55,6 +142,97 @@ def main():
         if args.one_shot:
             print('[Info] Video detected; disabling one-shot mode (only for static images).')
         args.one_shot = False
+        # Chunked processing for long videos
+        if args.enable_chunking and args.chunk_duration and args.chunk_duration > 0:
+            try:
+                video_dur = _ffprobe_duration(args.face) or 0
+                if video_dur > args.chunk_duration + 0.5:
+                    # Probe fps
+                    cap_tmp = cv2.VideoCapture(args.face)
+                    fps_probe = cap_tmp.get(cv2.CAP_PROP_FPS)
+                    cap_tmp.release()
+                    if not fps_probe or math.isclose(fps_probe, 0.0) or np.isnan(fps_probe):
+                        fps_probe = args.fps
+                    parts_dir = os.path.join('temp', args.tmp_dir, args.chunk_temp_dir)
+                    out_parts_dir = os.path.join('temp', args.tmp_dir, 'out_parts')
+                    os.makedirs(parts_dir, exist_ok=True)
+                    os.makedirs(out_parts_dir, exist_ok=True)
+                    print(f"[Chunk] Splitting into ~{args.chunk_duration}s chunks with overlap={args.chunk_overlap}s")
+                    chunks = _split_into_chunks(args.face, args.audio, parts_dir, fps_probe, args.chunk_duration, args.chunk_overlap, enforce_sr=16000, crossfade=args.chunk_crossfade)
+                    # Minimal required seconds for a mel window
+                    from utils import audio as _audio
+                    min_sec = (args.mel_step_size * _audio.hp.hop_size) / _audio.hp.sample_rate
+                    successes = []
+                    for ci, (vpath, apath) in enumerate(chunks, start=1):
+                        try:
+                            # Validate length
+                            c_dur = _ffprobe_duration(vpath) or 0
+                            if c_dur < min_sec:
+                                print(f"[Warn] Skipping chunk {ci:03d} too short: {c_dur:.3f}s < {min_sec:.3f}s")
+                                continue
+                            out_path = os.path.join(out_parts_dir, f'output_{ci:03d}.mp4')
+                            cmd = [sys.executable, os.path.abspath(__file__), '--face', vpath, '--audio', apath, '--outfile', out_path, '--fps', f'{fps_probe:.3f}', '--tmp_dir', f"{args.tmp_dir}/chunk_{ci:03d}", '--chunk_duration', '0']
+                            # Propagate useful flags
+                            if args.audio_preprocess: cmd.append('--audio_preprocess')
+                            if args.audio_normalize: cmd.append('--audio_normalize')
+                            if args.audio_denoise: cmd.append('--audio_denoise')
+                            if args.lip_temporal_smooth: cmd.append('--lip_temporal_smooth')
+                            # Always re-preprocess per chunk to avoid stale landmark/cached files mismatch
+                            cmd.append('--re_preprocess')
+                            try:
+                                subprocess.check_call(cmd, shell=False)
+                                successes.append(out_path)
+                            except subprocess.CalledProcessError as e:
+                                print(f"[Warn] Chunk {ci:03d} failed: {e}")
+                                continue
+                        except Exception as e:
+                            print(f"[Warn] Exception on chunk {ci:03d}: {e}")
+                            continue
+                    if len(successes) == 0:
+                        raise RuntimeError('No chunk processed successfully')
+                    final_out = args.outfile
+                    if args.chunk_crossfade:
+                        # Build crossfaded concatenation including audio
+                        concat_video = os.path.join('temp', args.tmp_dir, 'concat_video.mp4')
+                        _xfade_concatenate(successes, concat_video, max(0.0, args.chunk_overlap))
+                        # Just move to final (already has audio)
+                        if not os.path.isdir(os.path.dirname(final_out)):
+                            os.makedirs(os.path.dirname(final_out), exist_ok=True)
+                        if platform.system() == 'Windows':
+                            subprocess.check_call(['ffmpeg', '-loglevel', 'error', '-y', '-i', concat_video, '-c', 'copy', final_out], shell=False)
+                        else:
+                            subprocess.check_call(f'ffmpeg -loglevel error -y -i "{concat_video}" -c copy "{final_out}"', shell=True)
+                    else:
+                        # Concatenate videos (drop audio)
+                        concat_v_list = os.path.join('temp', args.tmp_dir, 'out_parts', 'concat_v.txt')
+                        with open(concat_v_list, 'w', encoding='utf-8') as f:
+                            for p in successes:
+                                _safe = os.path.abspath(p).replace('\\', '/')
+                                f.write(f"file '{_safe}'\n")
+                        concat_video = os.path.join('temp', args.tmp_dir, 'concat_video.mp4')
+                        _concat_media(concat_v_list, concat_video, stream='video', reencode=False, drop_audio=True)
+                        # Concatenate audios
+                        chunk_audios = [os.path.join(parts_dir, f) for f in sorted(os.listdir(parts_dir)) if f.lower().startswith('audio_') and f.lower().endswith('.wav')]
+                        concat_a_list = os.path.join('temp', args.tmp_dir, 'out_parts', 'concat_a.txt')
+                        with open(concat_a_list, 'w', encoding='utf-8') as f:
+                            for p in chunk_audios:
+                                _safe = os.path.abspath(p).replace('\\', '/')
+                                f.write(f"file '{_safe}'\n")
+                        concat_audio = os.path.join('temp', args.tmp_dir, 'concat_audio.wav')
+                        _concat_media(concat_a_list, concat_audio, stream='audio', reencode=False)
+                        # Merge A/V with -shortest
+                        if not os.path.isdir(os.path.dirname(final_out)):
+                            os.makedirs(os.path.dirname(final_out), exist_ok=True)
+                        if platform.system() == 'Windows':
+                            mcmd = ['ffmpeg', '-loglevel', 'error', '-y', '-i', concat_video, '-i', concat_audio, '-shortest', '-c:v', 'copy', final_out]
+                            subprocess.call(mcmd, shell=False)
+                        else:
+                            mcmd = f'ffmpeg -loglevel error -y -i "{concat_video}" -i "{concat_audio}" -shortest -c:v copy "{final_out}"'
+                            subprocess.call(mcmd, shell=True)
+                    print('outfile:', final_out)
+                    return
+            except Exception as e:
+                print(f"[Warn] Chunked processing fallback due to error: {e}")
         video_stream = cv2.VideoCapture(args.face)
         fps = video_stream.get(cv2.CAP_PROP_FPS)
 
@@ -90,8 +268,28 @@ def main():
         lm = kp_extractor.extract_keypoint(frames_pil, './temp/'+base_name+'_landmarks.txt')
     else:
         print('[Step 1] Using saved landmarks.')
-        lm = np.loadtxt('temp/'+base_name+'_landmarks.txt').astype(np.float32)
-        lm = lm.reshape([len(full_frames), -1, 2])
+        lm_path = 'temp/'+base_name+'_landmarks.txt'
+        try:
+            lm_raw = np.loadtxt(lm_path).astype(np.float32)
+        except Exception as e:
+            print(f"[Step 1] Failed to load saved landmarks ({e}); re-extracting.")
+            kp_extractor = KeypointExtractor()
+            lm = kp_extractor.extract_keypoint(frames_pil, './temp/'+base_name+'_landmarks.txt')
+        else:
+            total_vals = lm_raw.size
+            denom = 2 * len(full_frames)
+            if denom > 0 and total_vals % denom == 0:
+                k = total_vals // denom
+                try:
+                    lm = lm_raw.reshape([len(full_frames), k, 2])
+                except Exception:
+                    print('[Step 1] Saved landmarks shape mismatch; re-extracting.')
+                    kp_extractor = KeypointExtractor()
+                    lm = kp_extractor.extract_keypoint(frames_pil, './temp/'+base_name+'_landmarks.txt')
+            else:
+                print('[Step 1] Saved landmarks length does not match frames; re-extracting.')
+                kp_extractor = KeypointExtractor()
+                lm = kp_extractor.extract_keypoint(frames_pil, './temp/'+base_name+'_landmarks.txt')
        
     if not os.path.isfile('temp/'+base_name+'_coeffs.npy') or args.exp_img is not None or args.re_preprocess:
         net_recon = load_face3d_net(args.face3d_net_path, device)
@@ -213,19 +411,81 @@ def main():
     mel_frames_per_second = audio.hp.sample_rate / audio.hp.hop_size
     mel_step_size = args.mel_step_size
     mel_idx_multiplier = (mel_frames_per_second / fps) * args.mel_multiplier_scale
-    i, mel_chunks = 0, []
-    while True:
-        start_idx = int(i * mel_idx_multiplier)
-        if start_idx + mel_step_size > len(mel[0]):
-            mel_chunks.append(mel[:, len(mel[0]) - mel_step_size:])
-            break
-        mel_chunks.append(mel[:, start_idx : start_idx + mel_step_size])
-        i += 1
+    # Build one mel chunk per video frame (1:1 alignment)
+    def build_mel_chunks(offset_frames):
+        chunks = []
+        T = mel.shape[1]
+        for frame_idx in range(len(full_frames)):
+            start_idx = int(round(frame_idx * mel_idx_multiplier)) + int(offset_frames)
+            end_idx = start_idx + mel_step_size
+            if start_idx >= T:
+                m = np.zeros((mel.shape[0], mel_step_size), dtype=mel.dtype)
+            elif end_idx > T:
+                pad = end_idx - T
+                m = np.pad(mel[:, start_idx:], ((0, 0), (0, pad)), mode='constant')
+            elif start_idx < 0:
+                pad = -start_idx
+                take = mel[:, :max(0, end_idx)]
+                m = np.pad(take, ((0,0),(pad,0)), mode='constant')
+                if m.shape[1] < mel_step_size:
+                    m = np.pad(m, ((0,0),(0, mel_step_size - m.shape[1])), mode='constant')
+            else:
+                m = mel[:, start_idx:end_idx]
+            chunks.append(m)
+        return chunks
 
+    base_offset = int(args.mel_offset_frames)
+    mel_chunks = build_mel_chunks(base_offset)
+
+    # Optional: auto calibration of global offset by correlating mouth openness with mel energy
+    if (not args.static) and getattr(args, 'auto_sync_calibrate', False):
+        try:
+            # Compute mouth openness per frame from 68-point landmarks
+            # Using pairs: (62,66), (63,67), (61,65) in 0-based indices
+            def mouth_open_metric(lms):
+                if lms is None or len(lms) < 68:
+                    return 0.0
+                p = lms
+                pairs = [(62,66), (63,67), (61,65)]
+                vals = []
+                for a,b in pairs:
+                    ya, yb = float(p[a][1]), float(p[b][1])
+                    vals.append(abs(yb - ya))
+                return float(np.mean(vals)) if len(vals) > 0 else 0.0
+
+            mouth_series = np.array([mouth_open_metric(land) for land in lm[:len(full_frames)]], dtype=np.float32)
+            energy_series = np.array([float((mc * mc).mean()) for mc in mel_chunks], dtype=np.float32)
+            # Normalize
+            def nz_norm(x):
+                x = x - x.mean()
+                s = x.std()
+                return x / (s if s > 1e-6 else 1.0)
+            m_norm = nz_norm(mouth_series)
+            e_norm = nz_norm(energy_series)
+            max_lag = int(getattr(args, 'calibrate_window', 6))
+            best_corr, best_off = -1e9, 0
+            for off in range(-max_lag, max_lag+1):
+                if off >= 0:
+                    mn = m_norm[off:]
+                    en = e_norm[:len(m_norm)-off]
+                else:
+                    mn = m_norm[:off]
+                    en = e_norm[-off:]
+                L = min(len(mn), len(en))
+                if L < 10:
+                    continue
+                c = float(np.corrcoef(mn[:L], en[:L])[0,1])
+                if c > best_corr:
+                    best_corr, best_off = c, off
+            if best_off != 0:
+                print(f"[Calibrate] Best offset {best_off} frames (corr={best_corr:.3f}). Rebuilding mel chunks.")
+                base_offset += best_off
+                mel_chunks = build_mel_chunks(base_offset)
+        except Exception as e:
+            print(f"[Calibrate] Skipped due to error: {e}")
+
+    print(f"✅ Built {len(mel_chunks)} mel chunks for {len(full_frames)} frames (multiplier={mel_idx_multiplier:.3f}, offset_frames={base_offset})")
     print("[Step 4] Load audio; Length of mel chunks: {}".format(len(mel_chunks)))
-    imgs = imgs[:len(mel_chunks)]
-    full_frames = full_frames[:len(mel_chunks)]  
-    lm = lm[:len(mel_chunks)]
     
     imgs_enhanced = []
     for idx in tqdm(range(len(imgs)), desc='[Step 5] Reference Enhancement'):
@@ -244,11 +504,52 @@ def main():
 
     kp_extractor = KeypointExtractor()
     prev_lip_patch = None
+    temporal_buffer = []
+    temporal_window = max(1, int(getattr(args, 'lip_temporal_window', 5)))
+    lip_mode = str(getattr(args, 'lip_temporal_mode', 'ema')).lower()
+    # Optional warmup run to stabilize first frames
+    if getattr(args, 'warmup_frames', 0) and args.warmup_frames > 0:
+        try:
+            warm_item = next(gen)
+            img_batch, mel_batch, frames, coords, img_original, f_frames = warm_item
+            img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
+            mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
+            img_original = torch.FloatTensor(np.transpose(img_original, (0, 3, 1, 2))).to(device)/255.
+            with torch.no_grad():
+                incomplete, reference = torch.split(img_batch, 3, dim=1)
+                _ = model(mel_batch, img_batch, reference)
+        except StopIteration:
+            pass
+        # Recreate generator so we don't lose the first batch
+        gen = datagen(imgs_enhanced.copy(), mel_chunks, full_frames, None, (oy1,oy2,ox1,ox2))
     for i, (img_batch, mel_batch, frames, coords, img_original, f_frames) in enumerate(tqdm(gen, desc='[Step 6] Lip Synthesis:', total=int(np.ceil(float(len(mel_chunks)) / args.LNet_batch_size)))):
         img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
         mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
         img_original = torch.FloatTensor(np.transpose(img_original, (0, 3, 1, 2))).to(device)/255. # BGR -> RGB
         
+        # Validate mel batches to ensure minimum spatial dimensions
+        valid_indices = []
+        for bi in range(mel_batch.shape[0]):
+            sample = mel_batch[bi]
+            if sample.shape[-1] < 3 or sample.shape[-2] < 3:
+                print(f"⚠️ Skipping invalid mel chunk shape: {tuple(sample.shape)}")
+            else:
+                valid_indices.append(bi)
+
+        if len(valid_indices) == 0:
+            raise ValueError("❌ All mel chunks were invalid. Check audio length or hop_size.")
+
+        if len(valid_indices) != mel_batch.shape[0]:
+            mel_batch = mel_batch[valid_indices]
+            img_batch = img_batch[valid_indices]
+            img_original = img_original[valid_indices]
+            # Also filter associated metadata to keep alignment
+            frames = [frames[j] for j in valid_indices]
+            coords = [coords[j] for j in valid_indices]
+            f_frames = [f_frames[j] for j in valid_indices]
+
+        print(f"✅ Proceeding with {mel_batch.shape[0]} valid mel chunks of shape {tuple(mel_batch.shape[-2:])}")
+
         with torch.no_grad():
             incomplete, reference = torch.split(img_batch, 3, dim=1) 
             pred, low_res = model(mel_batch, img_batch, reference)
@@ -280,15 +581,39 @@ def main():
         pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
 
         if args.lip_temporal_smooth:
-            blend_weight = min(max(args.temporal_blend_weight, 0.0), 1.0)
+            base_weight = min(max(args.temporal_blend_weight, 0.0), 1.0)
+            adaptive = getattr(args, 'temporal_blend_auto', False)
+            k = float(getattr(args, 'temporal_blend_k', 5.0))
             smoothed = []
-            for p in pred:
-                if prev_lip_patch is None:
-                    smoothed_patch = p
-                else:
-                    smoothed_patch = (1.0 - blend_weight) * p + blend_weight * prev_lip_patch
-                smoothed.append(smoothed_patch)
-                prev_lip_patch = smoothed_patch
+            # Compute per-sample energy from current mel_batch
+            try:
+                mel_energy = (mel_batch ** 2).mean(dim=[1,2,3]).detach().cpu().numpy()
+                e_min, e_max = float(mel_energy.min()), float(mel_energy.max())
+                denom = (e_max - e_min) if (e_max - e_min) > 1e-6 else 1.0
+                mel_energy_n = (mel_energy - e_min) / denom
+            except Exception:
+                adaptive = False
+                mel_energy_n = None
+            for idx, p in enumerate(pred):
+                out_patch = p
+                # EMA smoothing using previous frame
+                if lip_mode in ['ema', 'both']:
+                    if prev_lip_patch is not None:
+                        if adaptive and mel_energy_n is not None:
+                            w = base_weight * float(np.exp(-k * mel_energy_n[idx]))
+                        else:
+                            w = base_weight
+                        w = float(min(max(w, 0.0), 1.0))
+                        out_patch = (1.0 - w) * p + w * prev_lip_patch
+                # Median over a small temporal window to remove flicker
+                if lip_mode in ['median', 'both']:
+                    temporal_buffer.append(out_patch)
+                    if len(temporal_buffer) > temporal_window:
+                        temporal_buffer.pop(0)
+                    stack = np.stack(temporal_buffer, axis=0)
+                    out_patch = np.median(stack, axis=0)
+                smoothed.append(out_patch)
+                prev_lip_patch = out_patch
             pred = np.stack(smoothed, axis=0)
 
         torch.cuda.empty_cache()
@@ -306,12 +631,30 @@ def main():
             mm = [0,   0,   0,   0,   0,   0,   0,   0,   0,  0, 255, 255, 255, 0, 0, 0, 0, 0, 0]
             mouse_mask = np.zeros_like(restored_img)
             tmp_mask = enhancer.faceparser.process(restored_img[y1:y2, x1:x2], mm)[0]
+            tmp_mask = mask_postprocess(tmp_mask, thres=getattr(args, 'mask_feather', 20))
             mouse_mask[y1:y2, x1:x2]= cv2.resize(tmp_mask, (x2 - x1, y2 - y1))[:, :, np.newaxis] / 255.
 
             height, width = ff.shape[:2]
-            restored_img, ff, full_mask = [cv2.resize(x, (512, 512)) for x in (restored_img, ff, np.float32(mouse_mask))]
+            # Ensure shapes align for blending at native resolution
+            restored_img = restored_img if restored_img.shape[:2] == (height, width) else cv2.resize(restored_img, (width, height))
+            ff = ff if ff.shape[:2] == (height, width) else cv2.resize(ff, (width, height))
+            full_mask = np.float32(mouse_mask)
+            if full_mask.shape[:2] != (height, width):
+                full_mask = cv2.resize(full_mask, (width, height))
+            # --- Shape alignment fix for Laplacian blending ---
+            if restored_img.shape != ff.shape:
+                ff = cv2.resize(ff, (restored_img.shape[1], restored_img.shape[0]))
+                print(f"[Fix] Resized ff to {ff.shape} to match restored_img")
+            if full_mask.shape[:2] != restored_img.shape[:2]:
+                full_mask = cv2.resize(full_mask, (restored_img.shape[1], restored_img.shape[0]))
+                print(f"[Fix] Resized full_mask to {full_mask.shape} to match restored_img")
+            print("Shapes before blending:", restored_img.shape, ff.shape, full_mask.shape)
             img = Laplacian_Pyramid_Blending_with_mask(restored_img, ff, full_mask[:, :, 0], 12)
-            pp = np.uint8(cv2.resize(np.clip(img, 0 ,255), (width, height)))
+            img = np.clip(img, 0, 255)
+            if img.shape[:2] != (height, width):
+                pp = np.uint8(cv2.resize(img, (width, height)))
+            else:
+                pp = np.uint8(img)
 
             pp, orig_faces, enhanced_faces = enhancer.process(pp, xf, bbox=c, face_enhance=True, possion_blending=False)
             out.write(pp)
@@ -319,8 +662,12 @@ def main():
     
     if not os.path.isdir(os.path.dirname(args.outfile)):
         os.makedirs(os.path.dirname(args.outfile), exist_ok=True)
-    command = 'ffmpeg -loglevel error -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/{}/result.mp4'.format(args.tmp_dir), args.outfile)
-    subprocess.call(command, shell=platform.system() != 'Windows')
+    if platform.system() == 'Windows':
+        command = ['ffmpeg', '-loglevel', 'error', '-y', '-i', args.audio, '-i', 'temp/{}/result.mp4'.format(args.tmp_dir), '-shortest', '-c:v', 'copy', args.outfile]
+        subprocess.call(command, shell=False)
+    else:
+        command = 'ffmpeg -loglevel error -y -i {} -i {} -shortest -c:v copy {}'.format(args.audio, 'temp/{}/result.mp4'.format(args.tmp_dir), args.outfile)
+        subprocess.call(command, shell=True)
     print('outfile:', args.outfile)
 
 
@@ -337,7 +684,14 @@ def datagen(frames, mels, full_frames, frames_pil, cox):
     lms = kp_extractor.extract_keypoint(fr_pil, 'temp/'+base_name+'x12_landmarks.txt')
     frames_pil = [ (lm, frame) for frame,lm in zip(fr_pil, lms)] # frames is the croped version of modified face
     crops, orig_images, quads  = crop_faces(image_size, frames_pil, scale=1.0, use_fa=True)
-    inverse_transforms = [calc_alignment_coefficients(quad + 0.5, [[0, 0], [0, image_size], [image_size, image_size], [image_size, 0]]) for quad in quads]
+    # Guard against invalid (NaN/inf) quads by reusing last valid or falling back to identity
+    clean_quads = []
+    identity_quad = np.array([[0, 0], [0, image_size], [image_size, image_size], [image_size, 0]], dtype=np.float32)
+    for q in quads:
+        if q is None or (not np.isfinite(q).all()):
+            q = clean_quads[-1] if len(clean_quads) > 0 else identity_quad
+        clean_quads.append(q)
+    inverse_transforms = [calc_alignment_coefficients(q + 0.5, [[0, 0], [0, image_size], [image_size, image_size], [image_size, 0]]) for q in clean_quads]
     del kp_extractor.detector
 
     oy1,oy2,ox1,ox2 = cox
@@ -354,7 +708,7 @@ def datagen(frames, mels, full_frames, frames_pil, cox):
         refs.append(ff[y1: y2, x1:x2])
 
     for i, m in enumerate(mels):
-        idx = 0 if args.static else i % len(frames)
+        idx = 0 if args.static else i
         frame_to_save = frames[idx].copy()
         face = refs[idx]
         oface, coords = face_det_results[idx].copy()

@@ -69,6 +69,37 @@ def options():
                         help='Enable temporal smoothing for synthesized lip frames before blending back to the video')
     parser.add_argument('--temporal_blend_weight', type=float, default=0.3,
                         help='Blend weight used when lip temporal smoothing is enabled (0 disables, closer to 1 increases smoothing)')
+    parser.add_argument('--temporal_blend_auto', action='store_true', default=False,
+                        help='Adapt smoothing by mel energy (less smoothing on loud phonemes)')
+    parser.add_argument('--temporal_blend_k', type=float, default=5.0,
+                        help='Sharpness of energy-to-weight mapping when temporal_blend_auto is enabled')
+    parser.add_argument('--lip_temporal_mode', type=str, default='ema', choices=['ema', 'median', 'both'],
+                        help='Temporal smoothing mode for lips: ema (prev-frame), median (window), or both')
+    parser.add_argument('--lip_temporal_window', type=int, default=5,
+                        help='Window size for median temporal smoothing when enabled')
+    parser.add_argument('--mel_offset_frames', type=int, default=0,
+                        help='Global offset in mel frames applied to alignment (positive -> later)')
+    parser.add_argument('--auto_sync_calibrate', action='store_true', default=True,
+                        help='Estimate best mel-frame offset by correlating mouth openness and mel energy')
+    parser.add_argument('--calibrate_window', type=int, default=6,
+                        help='Max absolute frame offset to search during calibration')
+    parser.add_argument('--lock_box_from_first', action='store_true',
+                        help='Detect box on first frame and reuse for all frames to reduce jitter')
+    parser.add_argument('--mask_feather', type=int, default=20,
+                        help='Feather width (in pixels) for mouth mask postprocess to reduce seams')
+    # Chunking and warmup controls
+    parser.add_argument('--enable_chunking', action='store_true', default=True,
+                        help='Automatically split long videos into chunks for stable sync')
+    parser.add_argument('--chunk_duration', type=float, default=5.0,
+                        help='Chunk duration in seconds (set 0 to disable)')
+    parser.add_argument('--chunk_overlap', type=float, default=0.1,
+                        help='Overlap in seconds between consecutive chunks')
+    parser.add_argument('--chunk_crossfade', action='store_true', default=False,
+                        help='Apply crossfade between chunk boundaries (re-encodes)')
+    parser.add_argument('--chunk_temp_dir', type=str, default='parts',
+                        help='Subfolder under temp/<tmp_dir> to store chunk files')
+    parser.add_argument('--warmup_frames', type=int, default=2,
+                        help='Run warmup frames per chunk before writing outputs')
     
     args = parser.parse_args()
     return args
@@ -80,10 +111,18 @@ exp_aus_dict = {        # AU01_r, AU02_r, AU04_r, AU05_r, AU06_r, AU07_r, AU09_r
 }
 
 def mask_postprocess(mask, thres=20):
-    mask[:thres, :] = 0; mask[-thres:, :] = 0
-    mask[:, :thres] = 0; mask[:, -thres:] = 0
-    mask = cv2.GaussianBlur(mask, (101, 101), 11)
-    mask = cv2.GaussianBlur(mask, (101, 101), 11)
+    # Clamp feather threshold to mask size
+    h, w = mask.shape[:2]
+    t = int(max(1, min(thres, min(h, w) // 4)))
+    mask[:t, :] = 0; mask[-t:, :] = 0
+    mask[:, :t] = 0; mask[:, -t:] = 0
+    # Choose a valid odd Gaussian kernel <= min(h, w)
+    base = max(3, min(101, (min(h, w) // 2) * 2 + 1))
+    if base % 2 == 0:
+        base = max(3, base - 1)
+    sigma = max(1.0, base / 9.0)
+    mask = cv2.GaussianBlur(mask, (base, base), sigma)
+    mask = cv2.GaussianBlur(mask, (base, base), sigma)
     return mask.astype(np.float32)
 
 def trans_image(image):
@@ -136,6 +175,42 @@ def face_detect(images, args, jaw_correction=False, detector=None):
         detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D, 
                                                 flip_input=False, device=device)
 
+    # If user provided a fixed bounding box, respect it for all frames
+    if hasattr(args, 'box') and args.box is not None and len(args.box) == 4 and all([v != -1 for v in args.box]):
+        top, bottom, left, right = args.box
+        pady1, pady2, padx1, padx2 = args.pads if jaw_correction else (0,30,0,0)
+        results = []
+        for image in images:
+            h, w = image.shape[:2]
+            y1 = max(0, top - pady1)
+            y2 = min(h, bottom + pady2)
+            x1 = max(0, left - padx1)
+            x2 = min(w, right + padx2)
+            results.append([x1, y1, x2, y2])
+        boxes = np.array(results)
+        results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2)] for image, (x1, y1, x2, y2) in zip(images, boxes)]
+        del detector
+        torch.cuda.empty_cache()
+        return results
+
+    # Optionally lock the detection box from the first frame for all subsequent frames
+    if getattr(args, 'lock_box_from_first', False):
+        pady1, pady2, padx1, padx2 = args.pads if jaw_correction else (0,30,0,0)
+        first = images[0]
+        rect0 = detector.get_detections_for_batch(np.array([first]))[0]
+        if rect0 is None:
+            h, w = first.shape[:2]
+            rect0 = [0, 0, w, h]
+        y1 = max(0, rect0[1] - pady1)
+        y2 = min(first.shape[0], rect0[3] + pady2)
+        x1 = max(0, rect0[0] - padx1)
+        x2 = min(first.shape[1], rect0[2] + padx2)
+        boxes = np.array([[x1, y1, x2, y2] for _ in images])
+        results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2)] for image in images]
+        del detector
+        torch.cuda.empty_cache()
+        return results
+
     batch_size = args.face_det_batch_size    
     while 1:
         predictions = []
@@ -154,10 +229,9 @@ def face_detect(images, args, jaw_correction=False, detector=None):
     pady1, pady2, padx1, padx2 = args.pads if jaw_correction else (0,30,0,0)
     for rect, image in zip(predictions, images):
         if rect is None:
-            cv2.imwrite('temp/faulty_frame.jpg', image) # check this frame where the face was not detected.
-            #raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
-            print("[Aviso] Nenhum rosto detectado neste frame — usando frame original.")
-            return None
+            # Fallback to full frame if detection fails, and continue
+            h, w = image.shape[:2]
+            rect = [0, 0, w, h]
 
         y1 = max(0, rect[1] - pady1)
         y2 = min(image.shape[0], rect[3] + pady2)
@@ -246,6 +320,10 @@ def Laplacian_Pyramid_Blending_with_mask(A, B, m, num_levels = 6):
     ls_ = LS[0]
     for i in range(1,num_levels):
         ls_ = cv2.pyrUp(ls_)
+        # --- Fix: handle shape mismatches between pyramid levels ---
+        if ls_.shape[:2] != LS[i].shape[:2]:
+            LS[i] = cv2.resize(LS[i], (ls_.shape[1], ls_.shape[0]))
+            print(f"[Fix] Resized LS[{i}] from pyramid to match {ls_.shape}")
         ls_ = cv2.add(ls_, LS[i])
     return ls_
 

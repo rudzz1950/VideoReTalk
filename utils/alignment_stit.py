@@ -69,6 +69,9 @@ def align_face(filepath_or_image, predictor, output_size, detector=None,
 def crop_image(filepath, output_size, quad, enable_padding=False):
     x = (quad[3] - quad[1]) / 2
     qsize = np.hypot(*x) * 2
+    # Guard against invalid qsize
+    if not np.isfinite(qsize):
+        qsize = float(output_size)
     # read image
     if isinstance(filepath, PIL.Image.Image):
         img = filepath
@@ -190,7 +193,20 @@ def crop_faces(IMAGE_SIZE, files, scale, center_sigma=0.0, xy_sigma=0.0, use_fa=
 def crop_faces_by_quads(IMAGE_SIZE, files, quads):
     orig_images = []
     crops = []
+    last_valid_quad = None
     for quad, (_, path) in tqdm(zip(quads, files), total=len(quads)):
+        # Sanitize quad: replace NaN/inf with last valid or full-image rectangle
+        if (quad is None) or (not np.isfinite(quad).all()):
+            if last_valid_quad is not None and np.isfinite(last_valid_quad).all():
+                quad = last_valid_quad.copy()
+            else:
+                if isinstance(path, PIL.Image.Image):
+                    w, h = path.size
+                else:
+                    img_tmp = PIL.Image.open(path)
+                    w, h = img_tmp.size
+                quad = np.array([[0, 0], [0, h], [w, h], [w, 0]], dtype=np.float32)
+        last_valid_quad = quad.copy()
         crop = crop_image(path, IMAGE_SIZE, quad.copy())
         orig_image = path # Image.open(path)
         orig_images.append(orig_image)

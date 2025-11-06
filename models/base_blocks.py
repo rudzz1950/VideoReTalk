@@ -20,6 +20,12 @@ class Conv2d(nn.Module):
         self.residual = residual
 
     def forward(self, x):
+        # Ensure minimum spatial size for convolution (avoid kernel > input)
+        h, w = x.shape[-2:]
+        if h < 3 or w < 3:
+            pad_h = max(0, 3 - h)
+            pad_w = max(0, 3 - w)
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
         out = self.conv_block(x)
         if self.residual:
             out += x
@@ -145,7 +151,24 @@ class ADAIN(nn.Module):
         # Part 1. generate parameter-free normalized activations
         normalized = self.param_free_norm(x)
         # Part 2. produce scaling and bias conditioned on feature
-        feature = feature.view(feature.size(0), -1)
+        # Ensure feature is a (B, C) vector; pool spatial dims if present
+        if feature.dim() == 4:
+            # B, C, H, W -> B, C
+            feature = F.adaptive_avg_pool2d(feature, (1, 1)).reshape(feature.size(0), -1)
+        elif feature.dim() > 2:
+            feature = feature.reshape(feature.size(0), -1)
+        # Align feature dimension to MLP input if needed
+        expected_in = self.mlp_shared[0].in_features
+        if feature.dim() == 2 and feature.size(1) != expected_in:
+            if feature.size(1) % expected_in == 0:
+                feature = feature.reshape(feature.size(0), expected_in, -1).mean(dim=2)
+            elif feature.size(1) > expected_in:
+                feature = feature[:, :expected_in]
+            else:
+                # pad with zeros to expected_in
+                pad = expected_in - feature.size(1)
+                feature = F.pad(feature, (0, pad), mode='constant', value=0)
+
         actv = self.mlp_shared(feature)
         gamma = self.mlp_gamma(actv)
         beta = self.mlp_beta(actv)
