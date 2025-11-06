@@ -87,6 +87,10 @@ def options():
                         help='Detect box on first frame and reuse for all frames to reduce jitter')
     parser.add_argument('--mask_feather', type=int, default=20,
                         help='Feather width (in pixels) for mouth mask postprocess to reduce seams')
+    parser.add_argument('--bbox_ema_beta', type=float, default=0.6,
+                        help='EMA smoothing factor for face detection boxes (0 disables)')
+    parser.add_argument('--quad_ema_beta', type=float, default=0.5,
+                        help='EMA smoothing factor for alignment quads (used in warping)')
     # Chunking and warmup controls
     parser.add_argument('--enable_chunking', action='store_true', default=True,
                         help='Automatically split long videos into chunks for stable sync')
@@ -100,6 +104,23 @@ def options():
                         help='Subfolder under temp/<tmp_dir> to store chunk files')
     parser.add_argument('--warmup_frames', type=int, default=2,
                         help='Run warmup frames per chunk before writing outputs')
+    # Optical flow temporal smoothing controls
+    parser.add_argument('--flow_temporal_smooth', action='store_true',
+                        help='Enable optical-flow-guided temporal smoothing of the lip patch')
+    parser.add_argument('--flow_blend_weight', type=float, default=0.4,
+                        help='Blend weight for warped previous lip patch (0..1)')
+    parser.add_argument('--flow_pyr_scale', type=float, default=0.5,
+                        help='Farneback pyramid scale (0..1)')
+    parser.add_argument('--flow_levels', type=int, default=3,
+                        help='Farneback number of pyramid levels')
+    parser.add_argument('--flow_winsize', type=int, default=21,
+                        help='Farneback averaging window size (odd)')
+    parser.add_argument('--flow_iters', type=int, default=3,
+                        help='Farneback iterations per pyramid level')
+    parser.add_argument('--flow_poly_n', type=int, default=5,
+                        help='Farneback size of pixel neighborhood (odd)')
+    parser.add_argument('--flow_poly_sigma', type=float, default=1.2,
+                        help='Farneback standard deviation of Gaussian used')
     
     args = parser.parse_args()
     return args
@@ -243,7 +264,40 @@ def face_detect(images, args, jaw_correction=False, detector=None):
     if not args.nosmooth:
         smooth_window = max(1, args.temporal_smooth_window)
         boxes = get_smoothened_boxes(boxes, T=smooth_window)
-    results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2)] for image, (x1, y1, x2, y2) in zip(images, boxes)]
+        # Apply EMA smoothing across frames for additional stability
+        beta = float(getattr(args, 'bbox_ema_beta', 0.0))
+        if beta > 0.0 and len(boxes) > 1:
+            ema_boxes = [boxes[0].astype(np.float32)]
+            prev = ema_boxes[0]
+            for b in boxes[1:]:
+                b = b.astype(np.float32)
+                prev = beta * prev + (1.0 - beta) * b
+                ema_boxes.append(prev)
+            boxes = np.stack(ema_boxes, axis=0)
+    # Convert to safe integer boxes per-frame and clamp to image bounds
+    int_boxes = []
+    for image, (x1, y1, x2, y2) in zip(images, boxes):
+        h, w = image.shape[:2]
+        x1i, y1i, x2i, y2i = [int(round(v)) for v in (x1, y1, x2, y2)]
+        x1i = max(0, min(x1i, w - 1))
+        x2i = max(0, min(x2i, w))
+        y1i = max(0, min(y1i, h - 1))
+        y2i = max(0, min(y2i, h))
+        # Ensure valid ordering and non-empty area
+        if x2i <= x1i:
+            if x1i + 1 < w:
+                x2i = x1i + 1
+            else:
+                x1i = max(0, w - 2)
+                x2i = w - 1
+        if y2i <= y1i:
+            if y1i + 1 < h:
+                y2i = y1i + 1
+            else:
+                y1i = max(0, h - 2)
+                y2i = h - 1
+        int_boxes.append((x1i, y1i, x2i, y2i))
+    results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2)] for image, (x1, y1, x2, y2) in zip(images, int_boxes)]
 
     del detector
     torch.cuda.empty_cache()

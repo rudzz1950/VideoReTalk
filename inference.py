@@ -504,6 +504,7 @@ def main():
 
     kp_extractor = KeypointExtractor()
     prev_lip_patch = None
+    prev_face_gray = None
     temporal_buffer = []
     temporal_window = max(1, int(getattr(args, 'lip_temporal_window', 5)))
     lip_mode = str(getattr(args, 'lip_temporal_mode', 'ema')).lower()
@@ -605,6 +606,37 @@ def main():
                             w = base_weight
                         w = float(min(max(w, 0.0), 1.0))
                         out_patch = (1.0 - w) * p + w * prev_lip_patch
+                # Optical-flow guided warping of previous patch to current geometry
+                if getattr(args, 'flow_temporal_smooth', False) and prev_lip_patch is not None:
+                    try:
+                        # Prepare current face gray image from original face patch
+                        cur_face_tensor = img_original[idx]  # shape: 3xH xW (RGB, 0..1)
+                        cur_face = (cur_face_tensor.detach().cpu().numpy().transpose(1, 2, 0) * 255.).astype(np.uint8)
+                        cur_gray = cv2.cvtColor(cur_face, cv2.COLOR_RGB2GRAY)
+                        if prev_face_gray is not None and prev_face_gray.shape == cur_gray.shape:
+                            flow = cv2.calcOpticalFlowFarneback(
+                                prev_face_gray, cur_gray, None,
+                                float(getattr(args, 'flow_pyr_scale', 0.5)),
+                                int(getattr(args, 'flow_levels', 3)),
+                                int(getattr(args, 'flow_winsize', 21)),
+                                int(getattr(args, 'flow_iters', 3)),
+                                int(getattr(args, 'flow_poly_n', 5)),
+                                float(getattr(args, 'flow_poly_sigma', 1.2)),
+                                0
+                            )
+                            h, w = cur_gray.shape
+                            grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+                            map_x = (grid_x + flow[..., 0]).astype(np.float32)
+                            map_y = (grid_y + flow[..., 1]).astype(np.float32)
+                            warped_prev = cv2.remap(prev_lip_patch.astype(np.float32), map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                            wf = float(getattr(args, 'flow_blend_weight', 0.4))
+                            wf = max(0.0, min(1.0, wf))
+                            out_patch = (1.0 - wf) * out_patch + wf * warped_prev
+                        # update prev_face_gray for next iteration
+                        prev_face_gray = cur_gray
+                    except Exception:
+                        # if any failure in flow, just skip silently
+                        pass
                 # Median over a small temporal window to remove flicker
                 if lip_mode in ['median', 'both']:
                     temporal_buffer.append(out_patch)
@@ -691,7 +723,19 @@ def datagen(frames, mels, full_frames, frames_pil, cox):
         if q is None or (not np.isfinite(q).all()):
             q = clean_quads[-1] if len(clean_quads) > 0 else identity_quad
         clean_quads.append(q)
-    inverse_transforms = [calc_alignment_coefficients(q + 0.5, [[0, 0], [0, image_size], [image_size, image_size], [image_size, 0]]) for q in clean_quads]
+    # EMA smooth the alignment quads to reduce temporal jitter in warping
+    beta_q = float(getattr(args, 'quad_ema_beta', 0.0))
+    if beta_q > 0.0 and len(clean_quads) > 1:
+        sm_quads = []
+        prev_q = clean_quads[0].astype(np.float32)
+        sm_quads.append(prev_q)
+        for q in clean_quads[1:]:
+            qf = q.astype(np.float32)
+            prev_q = beta_q * prev_q + (1.0 - beta_q) * qf
+            sm_quads.append(prev_q)
+    else:
+        sm_quads = clean_quads
+    inverse_transforms = [calc_alignment_coefficients(q + 0.5, [[0, 0], [0, image_size], [image_size, image_size], [image_size, 0]]) for q in sm_quads]
     del kp_extractor.detector
 
     oy1,oy2,ox1,ox2 = cox
