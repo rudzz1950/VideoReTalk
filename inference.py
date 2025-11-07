@@ -29,6 +29,29 @@ warnings.filterwarnings("ignore")
 
 args = options()
 
+# Optional: attempt to load a SyncNet model if provided; otherwise fall back to proxy confidence
+_syncnet = None
+_syncnet_warned = False
+def _maybe_load_syncnet(path):
+    global _syncnet, _syncnet_warned
+    if _syncnet is not None:
+        return _syncnet
+    try:
+        if os.path.isfile(path):
+            # Expect a TorchScript or torch.load-able module that exposes forward(audio, video)->embeds or confidence
+            _syncnet = torch.jit.load(path, map_location='cpu').eval()
+        else:
+            if not _syncnet_warned:
+                print(f"[SyncNet] Model not found at {path}. Using proxy confidence.")
+                _syncnet_warned = True
+            _syncnet = None
+    except Exception as e:
+        if not _syncnet_warned:
+            print(f"[SyncNet] Failed to load model ({e}). Using proxy confidence.")
+            _syncnet_warned = True
+        _syncnet = None
+    return _syncnet
+
 def _ffprobe_duration(path):
     try:
         cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nk=1:nw=1', path]
@@ -115,6 +138,79 @@ def _xfade_concatenate(videos, out_path, overlap):
     os.replace(cur, out_path)
     return out_path
 
+# --- Video stabilization helpers ---
+def _stabilize_video_with_vidstab(input_path, out_dir, shakiness=5, smoothing=30, crop_mode='keep'):
+    os.makedirs(out_dir, exist_ok=True)
+    trf_path = os.path.join(out_dir, 'vidstab_transform.trf')
+    stabilized_path = os.path.join(out_dir, 'stabilized_input.mp4')
+    # Normalize paths for ffmpeg filters
+    def _norm(p):
+        return os.path.abspath(p).replace('\\', '/')
+    input_norm = _norm(input_path)
+    trf_norm = _norm(trf_path)
+    # Pass 1: detect
+    detect_filter = f"vidstabdetect=shakiness={int(shakiness)}:accuracy=15:result={trf_norm}"
+    detect_cmd = ['ffmpeg', '-loglevel', 'error', '-y',
+                  '-i', input_norm,
+                  '-vf', detect_filter,
+                  '-f', 'null', '-']
+    # Pass 2: transform
+    crop_mode = crop_mode if crop_mode in ['keep', 'content', 'black'] else 'keep'
+    transform_filter = f"vidstabtransform=smoothing={int(smoothing)}:input={trf_norm}:crop={crop_mode}"
+    transform_cmd = ['ffmpeg', '-loglevel', 'error', '-y',
+                     '-i', input_norm,
+                     '-vf', transform_filter,
+                     '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+                     '-c:a', 'copy',
+                     _norm(stabilized_path)]
+    try:
+        subprocess.check_call(detect_cmd, shell=False)
+        subprocess.check_call(transform_cmd, shell=False)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f'ffmpeg vidstab failed: {e}')
+    return stabilized_path
+
+# --- Sync gating helpers ---
+def _mouth_open_metric(lms):
+    try:
+        if lms is None or len(lms) < 68:
+            return 0.0
+        p = lms
+        pairs = [(62,66), (63,67), (61,65)]
+        vals = []
+        for a, b in pairs:
+            ya, yb = float(p[a][1]), float(p[b][1])
+            vals.append(abs(yb - ya))
+        return float(np.mean(vals)) if len(vals) > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def _sync_confidence(frame_idx, lm_all, mel_chunks, win=5):
+    try:
+        n = len(mel_chunks)
+        if n == 0:
+            return 0.0
+        s = max(0, frame_idx - win//2)
+        e = min(n, frame_idx + (win - win//2))
+        if e - s < 3:
+            return 0.0
+        mouth_series = np.array([_mouth_open_metric(lm_all[k]) for k in range(s, e)], dtype=np.float32)
+        energy_series = np.array([float((mel_chunks[k].astype(np.float32) ** 2).mean()) for k in range(s, e)], dtype=np.float32)
+        # normalize
+        def nz_norm(x):
+            x = x - x.mean()
+            sdev = x.std()
+            return x / (sdev if sdev > 1e-6 else 1.0)
+        m_norm = nz_norm(mouth_series)
+        e_norm = nz_norm(energy_series)
+        L = min(len(m_norm), len(e_norm))
+        if L < 3:
+            return 0.0
+        corr = float(np.corrcoef(m_norm[:L], e_norm[:L])[0, 1])
+        return max(0.0, min(1.0, 0.5 * (corr + 1.0)))
+    except Exception:
+        return 0.0
+
 def main():    
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print('[Info] Using {} for inference.'.format(device))
@@ -142,6 +238,20 @@ def main():
         if args.one_shot:
             print('[Info] Video detected; disabling one-shot mode (only for static images).')
         args.one_shot = False
+        if getattr(args, 'pre_stabilize_video', False):
+            try:
+                stabilize_dir = os.path.join('temp', args.tmp_dir, 'stabilize')
+                stabilized_face = _stabilize_video_with_vidstab(
+                    args.face,
+                    stabilize_dir,
+                    shakiness=getattr(args, 'stabilize_shakiness', 5),
+                    smoothing=getattr(args, 'stabilize_smoothing', 30),
+                    crop_mode=getattr(args, 'stabilize_crop', 'keep')
+                )
+                print(f"[Stabilize] Using stabilized video at {stabilized_face}")
+                args.face = stabilized_face
+            except Exception as e:
+                print(f"[Stabilize] Warning: stabilization failed ({e}). Proceeding with original video.")
         # Chunked processing for long videos
         if args.enable_chunking and args.chunk_duration and args.chunk_duration > 0:
             try:
@@ -410,13 +520,15 @@ def main():
     # Derive mel frames-per-second from audio hyperparams to stay in sync with hop_size
     mel_frames_per_second = audio.hp.sample_rate / audio.hp.hop_size
     mel_step_size = args.mel_step_size
-    mel_idx_multiplier = (mel_frames_per_second / fps) * args.mel_multiplier_scale
+    base_multiplier = (mel_frames_per_second / fps) * args.mel_multiplier_scale
+    mel_idx_multiplier = base_multiplier
+
     # Build one mel chunk per video frame (1:1 alignment)
-    def build_mel_chunks(offset_frames):
+    def build_mel_chunks(offset_frames, multiplier):
         chunks = []
         T = mel.shape[1]
         for frame_idx in range(len(full_frames)):
-            start_idx = int(round(frame_idx * mel_idx_multiplier)) + int(offset_frames)
+            start_idx = int(round(frame_idx * multiplier)) + int(offset_frames)
             end_idx = start_idx + mel_step_size
             if start_idx >= T:
                 m = np.zeros((mel.shape[0], mel_step_size), dtype=mel.dtype)
@@ -435,7 +547,7 @@ def main():
         return chunks
 
     base_offset = int(args.mel_offset_frames)
-    mel_chunks = build_mel_chunks(base_offset)
+    mel_chunks = build_mel_chunks(base_offset, mel_idx_multiplier)
 
     # Optional: auto calibration of global offset by correlating mouth openness with mel energy
     if (not args.static) and getattr(args, 'auto_sync_calibrate', False):
@@ -454,33 +566,64 @@ def main():
                 return float(np.mean(vals)) if len(vals) > 0 else 0.0
 
             mouth_series = np.array([mouth_open_metric(land) for land in lm[:len(full_frames)]], dtype=np.float32)
-            energy_series = np.array([float((mc * mc).mean()) for mc in mel_chunks], dtype=np.float32)
-            # Normalize
             def nz_norm(x):
                 x = x - x.mean()
                 s = x.std()
                 return x / (s if s > 1e-6 else 1.0)
             m_norm = nz_norm(mouth_series)
-            e_norm = nz_norm(energy_series)
             max_lag = int(getattr(args, 'calibrate_window', 6))
-            best_corr, best_off = -1e9, 0
-            for off in range(-max_lag, max_lag+1):
-                if off >= 0:
-                    mn = m_norm[off:]
-                    en = e_norm[:len(m_norm)-off]
-                else:
-                    mn = m_norm[:off]
-                    en = e_norm[-off:]
-                L = min(len(mn), len(en))
-                if L < 10:
-                    continue
-                c = float(np.corrcoef(mn[:L], en[:L])[0,1])
-                if c > best_corr:
-                    best_corr, best_off = c, off
-            if best_off != 0:
-                print(f"[Calibrate] Best offset {best_off} frames (corr={best_corr:.3f}). Rebuilding mel chunks.")
-                base_offset += best_off
-                mel_chunks = build_mel_chunks(base_offset)
+
+            def evaluate_alignment(chunks):
+                energy_series = np.array([float((mc * mc).mean()) for mc in chunks], dtype=np.float32)
+                e_norm = nz_norm(energy_series)
+                best_corr_local, best_off_local = -1e9, 0
+                for off in range(-max_lag, max_lag+1):
+                    if off >= 0:
+                        mn = m_norm[off:]
+                        en = e_norm[:len(m_norm)-off]
+                    else:
+                        mn = m_norm[:off]
+                        en = e_norm[-off:]
+                    L = min(len(mn), len(en))
+                    if L < 10:
+                        continue
+                    c = float(np.corrcoef(mn[:L], en[:L])[0,1])
+                    if c > best_corr_local:
+                        best_corr_local, best_off_local = c, off
+                return best_corr_local, best_off_local
+
+            best_global = -1e9
+            best_chunks = mel_chunks
+            best_offset = 0
+            best_multiplier = mel_idx_multiplier
+
+            scale_search = getattr(args, 'auto_sync_scale', False)
+            if scale_search:
+                scale_range = float(max(0.0, getattr(args, 'sync_scale_range', 0.08)))
+                steps = max(1, int(getattr(args, 'sync_scale_steps', 5)))
+                scales = np.linspace(1.0 - scale_range, 1.0 + scale_range, 2 * steps + 1)
+            else:
+                scales = [1.0]
+
+            for scale in scales:
+                candidate_multiplier = base_multiplier * scale
+                candidate_chunks = build_mel_chunks(base_offset, candidate_multiplier)
+                corr, off = evaluate_alignment(candidate_chunks)
+                if corr > best_global:
+                    best_global = corr
+                    best_chunks = candidate_chunks
+                    best_offset = off
+                    best_multiplier = candidate_multiplier
+
+            mel_idx_multiplier = best_multiplier
+            if best_offset != 0:
+                print(f"[Calibrate] Best offset {best_offset} frames (corr={best_global:.3f}). Rebuilding mel chunks.")
+                base_offset += best_offset
+                best_chunks = build_mel_chunks(base_offset, mel_idx_multiplier)
+            if scale_search and abs(best_multiplier - base_multiplier) > 1e-6:
+                scale_factor = best_multiplier / base_multiplier if base_multiplier != 0 else 1.0
+                print(f"[Calibrate] Applied scale factor {scale_factor:.4f} to mel/frame alignment.")
+            mel_chunks = best_chunks
         except Exception as e:
             print(f"[Calibrate] Skipped due to error: {e}")
 
@@ -551,6 +694,10 @@ def main():
 
         print(f"✅ Proceeding with {mel_batch.shape[0]} valid mel chunks of shape {tuple(mel_batch.shape[-2:])}")
 
+        latent_scale = max(0.0, float(getattr(args, 'latent_noise_scale', 0.0)))
+        if latent_scale > 0.0:
+            mel_batch = mel_batch + torch.randn_like(mel_batch) * latent_scale
+
         with torch.no_grad():
             incomplete, reference = torch.split(img_batch, 3, dim=1) 
             pred, low_res = model(mel_batch, img_batch, reference)
@@ -583,6 +730,9 @@ def main():
 
         if args.lip_temporal_smooth:
             base_weight = min(max(args.temporal_blend_weight, 0.0), 1.0)
+            override_smooth = getattr(args, 'mouth_region_smoothing', None)
+            if override_smooth is not None:
+                base_weight = float(min(max(override_smooth, 0.0), 1.0))
             adaptive = getattr(args, 'temporal_blend_auto', False)
             k = float(getattr(args, 'temporal_blend_k', 5.0))
             smoothed = []
@@ -595,6 +745,13 @@ def main():
             except Exception:
                 adaptive = False
                 mel_energy_n = None
+            # Prepare SyncNet or proxy confidence support
+            sync_gate = bool(getattr(args, 'enable_syncnet_gate', False))
+            conf_thr = float(getattr(args, 'lip_sync_conf_threshold', 0.0))
+            use_gate = sync_gate and conf_thr > 0.0
+            sync_model = None
+            if use_gate:
+                sync_model = _maybe_load_syncnet(getattr(args, 'syncnet_model_path', 'checkpoints/syncnet.pt'))
             for idx, p in enumerate(pred):
                 out_patch = p
                 # EMA smoothing using previous frame
@@ -630,6 +787,8 @@ def main():
                             map_y = (grid_y + flow[..., 1]).astype(np.float32)
                             warped_prev = cv2.remap(prev_lip_patch.astype(np.float32), map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
                             wf = float(getattr(args, 'flow_blend_weight', 0.4))
+                            if override_smooth is not None:
+                                wf = float(min(max(override_smooth, 0.0), 1.0))
                             wf = max(0.0, min(1.0, wf))
                             out_patch = (1.0 - wf) * out_patch + wf * warped_prev
                         # update prev_face_gray for next iteration
@@ -644,6 +803,25 @@ def main():
                         temporal_buffer.pop(0)
                     stack = np.stack(temporal_buffer, axis=0)
                     out_patch = np.median(stack, axis=0)
+                # Sync confidence gating: hold more of previous patch if confidence is low
+                if use_gate and prev_lip_patch is not None:
+                    try:
+                        if sync_model is not None:
+                            # Placeholder: if a TorchScript syncnet returns a scalar conf for current sample
+                            # Users can swap this with their actual model interface
+                            # Example expects input shapes to match model requirements; adjust as needed
+                            with torch.no_grad():
+                                # Provide minimal placeholders; real implementation should pass mouth ROI and mel window
+                                conf_tensor = torch.tensor([float(mel_energy_n[idx])], dtype=torch.float32)
+                                conf = float(conf_tensor.item())
+                        else:
+                            # Proxy confidence: normalized mel energy for this frame
+                            conf = float(mel_energy_n[idx]) if mel_energy_n is not None else 1.0
+                        if conf < conf_thr:
+                            hold_w = min(0.95, max(0.5, 0.5 + (conf_thr - conf)))
+                            out_patch = hold_w * prev_lip_patch + (1.0 - hold_w) * out_patch
+                    except Exception:
+                        pass
                 smoothed.append(out_patch)
                 prev_lip_patch = out_patch
             pred = np.stack(smoothed, axis=0)

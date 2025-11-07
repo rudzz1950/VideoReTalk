@@ -73,6 +73,8 @@ def options():
                         help='Adapt smoothing by mel energy (less smoothing on loud phonemes)')
     parser.add_argument('--temporal_blend_k', type=float, default=5.0,
                         help='Sharpness of energy-to-weight mapping when temporal_blend_auto is enabled')
+    parser.add_argument('--mouth_region_smoothing', type=float, default=None,
+                        help='Override lip temporal smoothing weight (0..1). Higher reduces jitter, lower keeps more detail')
     parser.add_argument('--lip_temporal_mode', type=str, default='ema', choices=['ema', 'median', 'both'],
                         help='Temporal smoothing mode for lips: ema (prev-frame), median (window), or both')
     parser.add_argument('--lip_temporal_window', type=int, default=5,
@@ -83,6 +85,21 @@ def options():
                         help='Estimate best mel-frame offset by correlating mouth openness and mel energy')
     parser.add_argument('--calibrate_window', type=int, default=6,
                         help='Max absolute frame offset to search during calibration')
+    parser.add_argument('--auto_sync_scale', action='store_true', default=False,
+                        help='Also search for a mel/frame scale factor during sync calibration')
+    parser.add_argument('--sync_scale_range', type=float, default=0.08,
+                        help='Percent range (+/-) for scale search when auto_sync_scale is enabled (e.g. 0.08 => ±8%)')
+    parser.add_argument('--sync_scale_steps', type=int, default=5,
+                        help='Number of steps on each side of scale search (total samples = 2*steps+1)')
+    # Sync gating controls
+    parser.add_argument('--enable_syncnet_gate', action='store_true', default=False,
+                        help='Gate mouth blending based on lip–audio sync confidence')
+    parser.add_argument('--lip_sync_conf_threshold', type=float, default=0.85,
+                        help='Confidence threshold (0..1) to accept mouth update when gating is enabled')
+    parser.add_argument('--syncnet_window', type=int, default=5,
+                        help='Temporal window (frames) for sync confidence correlation')
+    parser.add_argument('--syncnet_model_path', type=str, default='checkpoints/syncnet.pt',
+                        help='Optional TorchScript SyncNet model path; proxy confidence used if missing')
     parser.add_argument('--lock_box_from_first', action='store_true',
                         help='Detect box on first frame and reuse for all frames to reduce jitter')
     parser.add_argument('--mask_feather', type=int, default=20,
@@ -121,6 +138,18 @@ def options():
                         help='Farneback size of pixel neighborhood (odd)')
     parser.add_argument('--flow_poly_sigma', type=float, default=1.2,
                         help='Farneback standard deviation of Gaussian used')
+    parser.add_argument('--latent_noise_scale', type=float, default=0.0,
+                        help='Scale of latent noise injected into mel features (set 0 to disable)')
+    # Optional full-frame stabilization using ffmpeg vidstab
+    parser.add_argument('--pre_stabilize_video', action='store_true', default=False,
+                        help='Apply ffmpeg vidstab stabilization pass on the input video before processing')
+    parser.add_argument('--stabilize_shakiness', type=int, default=5,
+                        help='vidstabdetect shakiness parameter (1-10). Higher handles larger shakes but is slower')
+    parser.add_argument('--stabilize_smoothing', type=int, default=30,
+                        help='vidstabtransform smoothing parameter controlling strength of stabilization')
+    parser.add_argument('--stabilize_crop', type=str, default='keep',
+                        help='vidstabtransform cropping behaviour: keep, content, or black')
+    # (SyncNet gating args defined above to avoid duplicates)
     
     args = parser.parse_args()
     return args
